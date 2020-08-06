@@ -2,7 +2,7 @@
 deeplabcut wrapper class to process live streams in real time
 
 Created by Nicholas Thomas
-Last Edited 7/10/2020
+Last Edited 8/05/2020
 
 Notes:
 
@@ -102,19 +102,8 @@ class StreamHandler:
             self.frame = [] #most recently retrieved frame
             self.streamCount = len(camIdx) #number of streams
             self.multiple = self.streamCount > 1
+            self.camIdx = camIdx
 
-            for i, stream in enumerate(camIdx):
-                if not isinstance(stream, (int, str)):
-                    raise Exception('Each individual stream must be an int or string')
-                self.streams.append(cv2.VideoCapture(stream))
-                self.poseData.append([]) #initalizes empty lists for all pose data
-                (self.grabbed, frame) = self.streams[i].read()
-                self.frame.append(frame)
-                if self.height == None:
-                    self.height = np.shape(frame)[0]
-                if self.width == None:
-                    self.width = np.shape(frame)[1]
-            self.curFrame = self.frame
             #self.updateMeta()
 
         elif camIdx == None:
@@ -123,8 +112,9 @@ class StreamHandler:
             raise Exception('Invalid input for camIdx')
 
     #Add flag to labelVideo or just capture stream to be done
-    def beginCapture(self, config, maxFrames = None, labelVideo = True, shuffle = 0, vidOut = False, fps = 30,
-                    resizeFactor = None, outputDir = None, capStreamFps = False, printFPS = False):
+    def beginCapture(self, config, maxFrames = None, labelVideo = True, shuffle = 0, vidOut = False,
+                    fps = 30, resizeFactor = None, outputDir = None, capStreamFps = False,
+                    printFPS = False, savePose=True, saveMeta=True, scorer = None, filetype = 'h5'):
 
         """Short Summary
         Parameters
@@ -145,10 +135,38 @@ class StreamHandler:
         capStreamFps : type = boolean
             A flag which when true, will synthetically enforce a framerate on the frame retrieval
             speed
+        printFPS : type = boolean
+            A flag which when true will continually print the framerate of the processing
+        autosave : boolean
+            a flag which when true will automatically save the pose and metaData
         """
 
         if labelVideo:
             sess, inputs, outputs, dlc_cfg = self.initializeDLC(config=config, shuffle=shuffle)
+
+        for i, stream in enumerate(self.camIdx):
+            if not isinstance(stream, (int, str)):
+                raise Exception('Each individual stream must be an int or string')
+            self.streams.append(cv2.VideoCapture(stream))
+            self.poseData.append([]) #initalizes empty lists for all pose data
+            (self.grabbed, frame) = self.streams[i].read()
+            self.frame.append(frame)
+            if self.height == None:
+                self.height = np.shape(frame)[0]
+            if self.width == None:
+                self.width = np.shape(frame)[1]
+
+        if self.multiple: #multiple streams
+            poses = self.analyzeMultipleFrames(frame, sess, inputs, outputs, dlc_cfg)
+            for i in range(self.streamCount):
+                self.poseData[i].append(poses[i])
+        else:
+            #list is of size 1, by indexing with 0, we pass in the frame array not list
+            pose = self.analyzeFrame(frame, sess, inputs, outputs, dlc_cfg)
+            self.poseData[0].append(pose)
+
+        self.curFrame = self.frame
+
 
         self.maxFrames = maxFrames
 
@@ -207,7 +225,6 @@ class StreamHandler:
                     frame = frame[0] #goes from list to cv object
 
                 self.meta['Time Read'][curIdx] = time.time() - self.startTime
-
                 #PROCESSING
                 if self.multiple: #multiple streams
                     poses = self.analyzeMultipleFrames(frame, sess, inputs, outputs, dlc_cfg)
@@ -217,6 +234,7 @@ class StreamHandler:
                     #list is of size 1, by indexing with 0, we pass in the frame array not list
                     pose = self.analyzeFrame(frame, sess, inputs, outputs, dlc_cfg)
                     self.poseData[0].append(pose)
+
 
                 procTime =  time.time() - self.startTime
                 self.meta['Time Processed'][curIdx] = procTime
@@ -245,6 +263,7 @@ class StreamHandler:
                     if vidOut:
                         videoWriters[i].write(frame[i])
 
+
             self.meta['Time Displayed'][curIdx] = time.time() - self.startTime
 
             if printFPS:
@@ -252,9 +271,15 @@ class StreamHandler:
                 sys.stdout.write(str(fps))
                 sys.stdout.flush()
             loopcount  += 1
+
+        if saveMeta:
+            self.metaDataDF = self.getMetaData(outputDir = outputDir)
+        if savePose:
+            self.poseDataDF = self.getPoseData(outputDir = outputDir, filetype = filetype, scorer=scorer)
+
         return
 
-    def getMetaData(self):
+    def getMetaData(self, outputDir = None, filetype = 'h5'):
         """Short Summary
         Returns the meta data for the stream handler object and the processed video stream. The meta
         data consists of time stamps and elapsed time for the different steps in the pipeline:
@@ -276,9 +301,16 @@ class StreamHandler:
         self.meta['Displaying Time'] = timedisp - timeproc
         self.meta['Total Time'] = timedisp - timeread
         metaData = pd.DataFrame.from_dict(self.meta)
+        if not outputDir == None:
+            if filetype == 'h5':
+                fileName = outputDir + 'metaData_{}.h5'.format(str(datetime.today().now())[:-7])
+                metaData.to_hdf(fileName, key='metaData')
+            elif filetype == 'csv':
+                fileName = outputDir + 'metaData_{}.csv'.format(str(datetime.today().now())[:-7])
+                metaData.to_csv(fileName, key='metaData')
         return metaData
 
-    def getPoseData(self, filetype=None, scorer=None):
+    def getPoseData(self, outputDir = None, filetype='h5', scorer=None):
         """Short Summary
         Returns the pose estimations for all the processed frames. If dropFrames is false, that will
         every frame in the stream. Note that the method will always return a list even if there is
@@ -305,10 +337,13 @@ class StreamHandler:
             cols = list(zip(scorer, bodyparts, columnNames))
             df.columns = pd.MultiIndex.from_tuples(cols, names = ["scorer", "bodypart", "coord"])
             poseDataFrames.append(df)
-        if filetype == 'h5':
-            print(filetype)
-        elif filetype == 'csv':
-            print(filetype)
+            if not outputDir == None:
+                if filetype == 'h5':
+                    fileName = outputDir + 'Cam{}_PoseEstimationData_{}.h5'.format(i, str(datetime.today().now())[:-7])
+                    df.to_hdf(fileName, key='df')
+                elif filetype == 'csv':
+                    fileName = outputDir + 'Cam{}_PoseEstimationData_{}.csv'.format(i, str(datetime.today().now())[:-7])
+                    df.to_csv(fileName, key='df')
         return poseDataFrames
 
 #HELPER METHODS
@@ -320,7 +355,7 @@ class StreamHandler:
         self.t.start()
         return self
 
-    #Helper method to stop the threaded operations.
+    #Helper method to stop the threaded operations.hre
     def stop(self):
         self.stopped = True
 
